@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Как я использую ArgoCD, чтобы управлять кластерами k8s</title>
+  <link rel="stylesheet" href="../../style.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/components/prism-yaml.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>Как я использую ArgoCD, чтобы управлять кластерами k8s</h1>
+  <hr>
+</header>
+
+
+<p>Вот уже как пару месяцев я изучаю k8s. Будучи бэкенд-разработчиком, мне хотелось лучше понимать, как созданные мною сервисы доезжают до кластера и деплоятся, что происходит во время rollback; освоить инструменты  kubectl и k9s, чтобы быстрее разбираться в инцидентах.</p>
+
+<p>Сначала я научился устанавливать кластер кубов с помощью kubeadm. Далее стал писать простые манифесты для подов, реплик, деплоев, сервисов и ингресса.  Ознакомился с helm - шаблонизатором для манифестов.</p>
+
+<p>Также удалось воссоздать CI/CD, который используется на моей текущей работе. Мои приложения напрямую деплоились в кластер. </p>
+
+<p>Позже мне захотелось добавить еще один кластер, который бы выполнял роль стейдж-окружения. Важно, чтобы стейдж-кластер был приближен к продовому. И тут я столкнулся с проблемой: а как мне перенести все настройки из уже существующего кластера Kubernetes в новый стейдж-кластер, чтобы они были идентичны? Как вообще быть с администрированием самих кубов, если количество объектов возростет до десятков тысяч? А если у меня будет 10 команд, то как на всех кластерах я буду создавать одни и те же namespaces, network policies, service accounts и делать это эффективно?</p>
+
+<h2>Первый прототип, проблемы и решение</h2>
+
+<p>Первой идеей было применить ту же практику CI/CD для администрирования кубов, что применяется и для обычных приложений.  Сценарий представлялся следующим:</p>
+
+<ul>
+<li>манифесты для соответствующего кластера буду храниться в репозитории на гит-сервере;</li>
+<li>создаю CI/CD и раннеры, которые будут применять манифесты в соответствующем кластере</li>
+</ul>
+
+<p>Реализовав прототип, я столкнулся со следующими сложностями:</p>
+
+<ul>
+<li>нужен отдельный класс раннеров с образом, который будет содержать в себе kubectl/helm-бинарники. Для каждого нужно настроить не только доступы к репозиториям, но и к кластерам кубов;</li>
+<li>раннеры довольно дорогие по ресурсам, если их не настроить;</li>
+<li>допустим, я создал репозиторий, с которого буду деплоить изменения на все кластеры. Что если части кластеров нужны свои особенные изменения? Например, квоты могут отличаться в зависимости от железа, на котором запущен кластер;</li>
+<li>если создать новый кластер, то как заставить его подтянуть все манифесты из уже существующего репозитория? Придется писать скрипт, который запустит все манифесты в нужном порядке и учтет все нюансы;</li>
+<li>что насчет rollback? Как определить последний примененный манифест?</li>
+</ul>
+
+<p>И если вопрос с настройкой раннеров, доступами и управлением внутри репозитория еще можно решить с помощью скриптов, то самый важный вопрос: как удостовериться, что все манифесты были применены в целевом кластере? kubectl apply/helm upgrade лишь подсветят, что манифесты были доставлены в кластер кубов, но не факт, что все изменения были применены. А что если кто-то исполнит kubectl edit, но забудет вернуть все в прежнее состояние? Как я пойму, что кластер соответствует желаемому состоянию?</p>
+
+<p>Чтобы решить данную проблему, я должен был ответить на два вопроса. Первое - что есть источник истины. Второе - кто будет эту истину доносить до кубов.</p>
+
+<p>Я уже хорошо знаком с практикой IaC при работе с инфраструктурой и весь код tofu храню в репозиториях. Такой же подход применю к манифестам - все они будут храниться в репозиториях. Так неосознанно прихожу к GitOps - практике управления инфраструктурой и приложениями, где источником истины есть git-сервер. Так нашел ответ на первый вопрос.</p>
+
+<p>А в качестве ответа на второй вопрос будет предоставлен ArgoCD.</p>
+
+<p>ArgoCD - GitOps-инструмент, который сам смотрит в источник данных (в нашем случае git-репозитории), постоянно сверяет желаемое состояние в виде манифестов в источнике с текущим состоянием кубернетес и, если они отличаются (иными словами, манифесты не были применены), применяет эти самые манифесты.</p>
+
+<p>ArgoCD вводит следующие понятия (приведу лишь основные), которые важны в рамках данной статьи:</p>
+
+<ul>
+<li>Application - обертка для манифестов кубов в виде CRD. Речь не только про deployment/daemonsets, а про все манифесты, которые могут быть применены;</li>
+<li>Application source type - что используется для создания приложения. Это могут быть как обычные манифесты, так и helm с kustomize;</li>
+<li>Sync - процесс приведения состояния кубов в желаемое состояние, то есть в то, что есть в гите. Можно сделать автоматическим или ручным. А можно настроить вебхуки.</li>
+</ul>
+
+<p>
+Я должен создать Application, который в качестве источника будет иметь некоторй репозиторий. Репозиторий может иметь различные виды Application - от обычных манифестов до helm-чартов. ArgoCD будет следить за репозиторием и если обнаружит изменения, то он начнет процесс синка (если он настроен выполняться автоматически). 
+</p>
+
+<h2>Как я применил ArgoCD</h2>
+
+<p>Я создал репозиторий iac-k8s-core, который будет источником настроек с манифестами для уже существующего кластера k8s-core.
+</p>
+
+<p>
+Написал  манифест rootapp.yaml для первого Application, который будет выступать в  роли корневого приложения:
+</p>
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8s-core-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://forgejo.lab/pirogov/iac-k8s-core.git
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: 
+      enabled: true
+---
+</code></pre>
+
+<p>Его применяю руками, чтобы ArgoCD начал сам следить за репозиторием iac-k8s-core. Чтобы убедиться в этом, можно зайди в web-UI :</p>
+
+<img src="k8s_core_root.png" alt="ArgoCD web UI showing the root application">
+
+<p>Более мне не придется писать <code>kubectl apply</code> для последующих Applications.</p>
+
+<p>Следом я добавил отдельный проект, в котором будут храниться все Applications, относящиеся к этому проекту.</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8s-core-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://forgejo.lab/pirogov/iac-k8s-core.git
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: 
+      enabled: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: k8s-core
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Here we will add application to manage k8s as iac (networking policies, service accounts and other stuff)
+  sourceNamespaces:
+  - '*'
+  sourceRepos:
+  - '*'
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: '*'
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  namespaceResourceWhitelist:
+  - group: '*'
+    kind: '*'
+
+
+</code></pre>
+
+<p>Важная оговорка - я разрешаю работать в проекте со всеми ресурсами и во всех неймспейсах, чтобы просто разобраться в работе инструмента. О безопасности речи не идет.</p>
+
+<h2>Добавляю репозиторий с общими настройками</h2>
+
+<p>Вернемся к изначальной задаче - мне хотелось бы иметь второй стейджовый кластер кубов, при этом, чтобы он был идентичен продовому:</p>
+
+<ul>
+<li>Оба кластера имели схожие базовые неймспейсы. </li>
+<li>Оба кластера имели схожие network policies.</li>
+<li>Оба кластера можно было мониторить с помощью kube-prometheus-stack.</li>
+</ul>
+
+<p>Для этого я создаю отдельный репозиторий iac-k8s-common. В нем будут содержаться манифесты, общие для всех кластеров. Чтобы не было одного большого манифеста с разными объектами и была возможность устанавливать свои значения, я добавил helm. Получилась следующая структура репы iac-k8s-common:</p>
+
+<pre><code class="language-yaml">.
+├── common
+│   ├── namespaces
+│   │   └── common.yaml
+│   └── networkpolicies
+│       └── common.yaml
+├── helm
+│   ├── Chart.yaml
+│   ├── templates
+│   │   └── applications.yaml
+│   └── values.yaml
+└── README.md
+
+</code></pre>
+
+<p>Шаблон <code>applications.yaml</code> выглядит следующим образом:</p>
+
+<pre><code class="language-yaml">{{- range .Values.commonApplications }}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .name }}
+  namespace: argocd
+  finalizers:
+  - resources-finalizer.argocd.argoproj.io
+spec:
+  destination:
+    namespace: argocd
+    server: https://kubernetes.default.svc
+  project: {{ $.Values.project }}
+  source:
+    path: {{ .path }}
+    repoURL: https://forgejo.lab/pirogov/iac-k8s-common.git
+    targetRevision: HEAD
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true
+---
+{{- end }}
+
+</code></pre>
+
+<p>Стандартные values.yaml будут содержать пути до манифестов:</p>
+
+<pre><code class="language-yaml">commonApplications:
+  - name: namespaces
+    path: common/namespaces
+  - name: network-policies
+    path: common/networkpolicies
+
+</code></pre>
+
+<p>И сами манифесты объектов:</p>
+
+<pre><code class="language-yaml"># common/namespaces/common.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test
+
+</code></pre>
+
+<pre><code class="language-yaml"># common/networkpolicies/common.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: test
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+</code></pre>
+
+<p>Обратите внимание, в репозитории iac-k8s-common в хелм-шаблоне applications.yaml используется {{ $.Values.project }}, значения которого нет ни в одном файле iac-k8s-common. Оно будет передаваться другими репозиториями.</p>
+
+<p>Вернемся к iac-k8s-core репозиторию. В Application можно указать несколько источников, на которые ArgoCD будет смотреть, чем и воспользовался в манифесте common.yaml. Он будет указывать в качестве источника репозиторий iac-k8s-common, а также передавать собственные значения в helm-чарт iac-k8s-common из манифеста values.yaml:</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8s-core-common
+  namespace: argocd
+spec:
+  project: k8s-core
+  sources:
+    - repoURL: https://forgejo.lab/pirogov/iac-k8s-common.git
+      targetRevision: HEAD
+      path: helm
+      helm:
+        releaseName: iac-k8s-core
+        valueFiles:
+        - $values/values.yaml
+    - repoURL: https://forgejo.lab/pirogov/iac-k8s-core.git
+      targetRevision: HEAD
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: 
+      enabled: false
+
+
+</code></pre>
+
+<p>Добавляю values.yaml c тем самым project:</p>
+
+<pre><code class="language-yaml">project: k8s-core
+
+</code></pre>
+
+<p>Репозиторий имеет следующие файлы:</p>
+
+<pre><code class="language-yaml">~/underground/forgejo/iac-k8s-core: tree .
+.
+├── common.yaml # манифест, который указывает на репозиторий с общими настройками
+├── README.md
+├── rootapp.yaml # манифест c приложением, который указывает на текущий репозиторий
+└── values.yaml # значения, которые будут переданы helm-чарту в репозиторий iac-k8s-common
+
+</code></pre>
+
+<p>По итогу получается такая схема.</p>
+
+<img src="k8score_scheme.png" alt="Diagram of the k8s-core and iac-k8s-common repositories">
+
+<p>
+Подведу итоги:
+<ol>
+<li>Я создал и применил манифест rootapp.yaml c Application, чтобы ArgoCD начал сам следить за репозиторием. </li>
+<li>Создал репозиторий iac-k8s-common, который хранит настройки, общие для всех k8s.</li>
+<li>Добавил common.yaml и values.yaml в репозитории iac-k8s-core, которые ссылаются на iac-k8s-common репозиторий.</li>
+<li>Запушив  common.yaml и values.yaml, ArgoCD заметил изменения и применил их.</li>
+<li>Теперь в качестве источника данных ArgoCD для работы с кластером k8s-core будут репозитории iac-k8s-core и iac-k8s-common.</li>
+</ol>
+</p>
+
+<p>Впоследствии я добавил kube-prometheus-stack в репозиторий iac-k8s-common и заставил ArgoCD синкануть все манифесты.</p>
+
+<img src="argocd_core.png" alt="ArgoCD web UI showing the core cluster applications">
+
+<h2>Добавляем новый кластер</h2>
+
+<p>Основной кластер k8s-core крутится на серверах Proxmox, но у меня также имеется кластер из одноплаток raspberry pi, где тоже имеется кластер k8s (назовем k8s-pi). Чтобы настроить новый кластер кубов и приблизить его к кластеру k8s-core, достаточно:</p>
+
+<ul>
+<li>создать репу для кластера (в моем случае iac-k8s-pi);</li>
+<li>создать rootapp.yaml и применить разово руками, чтобы ArgoCD начал смотреть за данной репой;</li>
+<li>добавить common.yaml и values.yaml, чтобы передать свои значения.</li>
+</ul>
+
+<p>И все.</p>
+
+<p>Структура репозитория iac-k8s-pi.</p>
+
+<pre><code class="language-yaml">.
+├── common.yaml
+├── README.md
+├── rootapp.yaml
+└── values.yaml
+
+
+</code></pre>
+
+<p>rootapp.yaml</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8s-pi-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://forgejo.lab/pirogov/iac-k8s-pi.git
+    targetRevision: HEAD
+    path: .
+    directory:
+      recurse: true
+      exclude: "metallb/*"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: 
+      enabled: true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: k8s-pi
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Here we will add application to manage k8s as iac (networking policies, service accounts and other stuff)
+  sourceNamespaces:
+  - '*'
+  sourceRepos:
+  - '*'
+  destinations:
+  - server: https://kubernetes.default.svc
+    namespace: '*'
+  clusterResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  namespaceResourceWhitelist:
+  - group: '*'
+    kind: '*'
+  - group: '*'
+    kind: '*'
+---
+
+</code></pre>
+
+<p>common.yaml:</p>
+
+<pre><code class="language-yaml">apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: k8s-pi-common
+  namespace: argocd
+spec:
+  project: k8s-pi
+  sources:
+    - repoURL: https://forgejo.lab/pirogov/iac-k8s-common.git
+      targetRevision: HEAD
+      path: helm
+      helm:
+        releaseName: iac-k8s-common
+        valueFiles:
+        - $values/values.yaml
+    - repoURL: https://forgejo.lab/pirogov/iac-k8s-pi.git
+      targetRevision: HEAD
+      ref: values
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      enabled: false
+
+</code></pre>
+
+<p>values.yaml</p>
+
+<pre><code class="language-yaml">project: k8s-pi
+
+</code></pre>
+
+<p>В большинстве своем вышла копипаста с изменением названия проекта и репозитория. Я зашел в web-UI argoCD кластера k8s-pi, чтобы убедиться, что все манифесты подтянулись:</p>
+
+<img src="argocd_pi.png" alt="ArgoCD web UI showing the Raspberry Pi cluster application">
+
+<p>Итоговая схема вышла такой:</p>
+
+<img src="final_schema.png" alt="Final GitOps architecture diagram">
+
+<p>
+Таким образом мне крайне легко будет подключать другие кластеры k8s и настраивать их.
+</p>
+
+
+<p><a href="../../index.html">Back to main page</a></p>
+</body>
+</html>

@@ -1,0 +1,44 @@
+body {
+  font-family: monospace;
+  margin: 40px;
+  text-align: left;
+  font-size: 20px;
+}
+
+header {
+  margin-bottom: 20px;
+}
+
+main,
+ul,
+li,
+img,
+p {
+  max-width: 40vw;
+  text-align: left;
+}
+
+h1 {
+  margin-bottom: 10px;
+}
+
+li {
+  margin-bottom: 10px;
+}
+
+a, a:visited, a:hover, a:active {
+  color: blue;
+}
+
+pre {
+  max-width: 40vw;
+  width: 40vw;
+  box-sizing: border-box;
+  overflow-x: auto;
+  text-align: left;
+}
+
+pre code {
+  font-family: monospace;
+  font-size: 20px;
+}
